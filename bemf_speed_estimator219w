@@ -1,0 +1,52 @@
+module bemf_speed_estimator (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire        sig_in,        // raw comparator output (async)
+    input  wire [5:0]  mos_state,     // sector/state gating
+    output reg  [31:0] period,        // cycles both are high
+    output reg         valid          // 1-cycle pulse when measurement completes
+);
+
+    // 2-flop synchronizer for comparator
+    reg sig_meta, sig_sync;
+    always @(posedge clk) begin
+        if (rst) begin
+            sig_meta <= 1'b0;
+            sig_sync <= 1'b0;
+        end else begin
+            sig_meta <= sig_in;
+            sig_sync <= sig_meta;
+        end
+    end
+
+    // Count overlap duration
+    reg [31:0] high_counter;
+    reg        counting;
+
+    wire overlap = mos_state[4] && sig_sync;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            high_counter <= 32'd0;
+            period       <= 32'd0;
+            valid        <= 1'b0;
+            counting     <= 1'b0;
+        end else begin
+            valid <= 1'b0;
+
+            if (overlap) begin
+                high_counter <= high_counter + 32'd1;
+                counting     <= 1'b1;
+            end else begin
+                // overlap just ended -> latch the duration
+                if (counting) begin
+                    period <= high_counter;
+                    valid  <= 1'b1;
+                end
+                high_counter <= 32'd0;
+                counting     <= 1'b0;
+            end
+        end
+    end
+
+endmodule
