@@ -141,6 +141,7 @@ int main()
     Upd();
 
     xil_printf("BLDC\r\n");
+    xil_printf("219\r\n");
 
     u16 cnt = 0;
     int n;
