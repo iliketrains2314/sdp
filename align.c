@@ -61,8 +61,8 @@ static volatile u32 gpio2_in_avg = 0;       // filtered period (midpoint of min/
 
 // ---------------- Align parameters ----------------
 #define ALIGN_TIME_MS   200      // hold vector for 200 ms
-#define ALIGN_SPD       600      // must be nonzero so TOP outputs are enabled
-#define ALIGN_TRQ       4000     // moderate duty (TOP uses torque[15:6])
+#define ALIGN_SPD       10000      // must be nonzero so TOP outputs are enabled
+#define ALIGN_TRQ       20000     // moderate duty (TOP uses torque[15:6])
 #define ALIGN_TRAP      0        // square during align (recommended)
 // -------------------------------------------------
 
@@ -89,7 +89,7 @@ static void Upd(void)
     XGpio_DiscreteWrite(&G1, 1, trap);
 
     // UPDATED: bit1 is align_en (repurposed from bemf)
-    XGpio_DiscreteWrite(&G1, 2, (test_bit<<3) | (1<<2) | (align_en<<1) | dir);
+    XGpio_DiscreteWrite(&G1, 2, (test_bit<<3) | (align_en<<2) | (0<<1) | dir);
 
     // Only write constant if sine wave disabled
     if (sine_enabled) {
@@ -110,44 +110,30 @@ static void align_rotor(void)
     u16 saved_spd  = spd;
     u16 saved_trq  = trq;
     u8  saved_trap = trap;
-    u8  saved_align = align_en;
 
-    xil_printf("ALIGN: start (saved_spd=%u)\r\n", saved_spd);
-
-    // Force safe align conditions
-    //  - square trapezoid
-    //  - moderate torque
-    //  - small nonzero speed so TOP outputs enable
+    // During align we want a fixed magnetic vector: square drive is simplest
     trap = ALIGN_TRAP;
     trq  = ALIGN_TRQ;
-    spd  = (saved_spd == 0) ? ALIGN_SPD : saved_spd;
 
-    // Ensure closed-loop BEMF path is off here if you have a software control for it.
-    // If enable_bemf is driven by a GPIO you control, force it off here.
-    // (If you don't have such a variable, skip/comment next line.)
-    // bemf = 0; // <-- only if your system maps this software variable to enable_bemf
+    // Must be nonzero for TOP to output anything; HDL will hold commutation_step during align_en
+    spd  = (saved_spd == 0) ? ALIGN_SPD : saved_spd;
 
     // Assert align
     align_en = 1;
     Upd();
+
+    // Hold
     usleep(ALIGN_TIME_MS * 1000);
 
-    // Deassert align, give FPGA a tiny settle time, then restore
+    // Release align
     align_en = 0;
-    Upd();
-    // small settle so FSMs and counters see the edge and can resume stepping
-    usleep(2000); // 2 ms
 
-    // restore
+    // Restore original requested values
     spd  = saved_spd;
     trq  = saved_trq;
     trap = saved_trap;
-    align_en = saved_align; // normally 0
 
-    // Update FPGA with restored values
     Upd();
-
-    xil_printf("ALIGN: done (restored_spd=%u)\r\n", spd);
 }
 
 // Detect start event: speed command goes from 0 -> nonzero
@@ -286,7 +272,7 @@ int main(void)
     Upd();
 
     xil_printf("BLDC\r\n");
-    xil_printf("312\r\n");
+    xil_printf("Please speed i need this :()\r\n");
 
     u16 cnt = 0;
     int n;
@@ -305,7 +291,7 @@ int main(void)
         if (c == 's') {
             xil_printf("S:");
             spd = (u16)GetNum();
-            //handle_start_event();  // NEW: auto-align on 0->nonzero
+            handle_start_event();  // NEW: auto-align on 0->nonzero
             Upd();
         }
         else if (c == 't') { xil_printf("T:"); trq = (u16)GetNum(); Upd(); }
