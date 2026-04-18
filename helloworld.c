@@ -1,29 +1,82 @@
 /**
- * Minimal BLDC Motor Controller - With Direct GPIO2 Interrupt & Sine Wave
+ * Minimal BLDC Motor Controller - With Direct GPIO2 Interrupt, Sine Wave,
+ * Rotor Align, and Startup Ramp
+ *
+ * Added:
+ * - Startup ramp when speed goes from 0 -> nonzero
+ * - Startup sequence: align -> ramp
+ * - ISR update suppression during align/ramp to avoid interference
+ *
+ * Notes:
+ * - Align only works in OPEN-LOOP TOP path, so keep enable_bemf=0 during align.
+ * - Align requires speed > 0 (TOP turns off outputs when speed==0), so align_rotor()
+ *   forces a small nonzero speed during align, then returns speed to 0 so the ramp
+ *   can take over cleanly.
  */
+
 #include "platform.h"
 #include "xil_printf.h"
 #include "xparameters.h"
 #include "xgpio.h"
 #include "xsysmon.h"
 #include "xil_exception.h"
+#include "sleep.h"     // usleep
 
 XSysMon S;
 XGpio G0, G1, G2, G3;
-u16 spd = 0, trq = 0, u = 0, v = 0, w = 0;
-u8 trap = 0, dir = 0, bemf = 0, test_bit = 0;
-volatile u32 gpio2_in = 0;
-volatile u32 gpio2_count = 0;
-u16 gpio3_in = 0;
-u32 rpm = 0;
-u32 current_rpm = 0;
 
+/* Shared control/state */
+volatile u16 spd = 0, trq = 0, u = 0, v = 0, w = 0;
+volatile u8  trap = 0, dir = 0, bemf = 0, test_bit = 0;
+
+/*
+ * Control word on G1 channel 2 (as written below):
+ *   bit0 = dir
+ *   bit1 = 0 (unused)
+ *   bit2 = align_en
+ *   bit3 = test_bit
+ */
+static volatile u8 align_en = 0;
+
+/* Track last commanded speed to detect 0 -> nonzero transitions */
+static volatile u16 last_spd_cmd = 0;
+
+/* Runtime measurements */
+volatile u32 gpio2_in = 0;        // raw GPIO2 ch1 (latest period sample)
+volatile u32 gpio2_count = 0;     // interrupt count
+volatile u16 gpio3_in = 0;
+volatile u32 rpm = 0;
+volatile u32 current_rpm = 0;
+volatile u32 scaled = 0;
+
+/* ---------------- Midpoint Filter (GPIO2 Channel 1) ---------------- */
+#define GPIO2_MA_LEN  32
+
+static volatile u32 gpio2_ma_buf[GPIO2_MA_LEN] = {0};
+static volatile u32 gpio2_ma_idx = 0;
+static volatile u32 gpio2_ma_count = 0;
+static volatile u32 gpio2_in_avg = 0;
+/* ------------------------------------------------------------------ */
+
+/* ---------------- Align parameters ---------------- */
+#define ALIGN_TIME_MS   200
+#define ALIGN_SPD       10000
+#define ALIGN_TRQ       20000
+#define ALIGN_TRAP      0
+/* -------------------------------------------------- */
+
+/* ---------------- Startup ramp parameters ---------------- */
+#define START_RAMP_BEGIN_SPD   3000
+#define START_RAMP_STEP         500
+#define START_RAMP_DELAY_MS      20
+/* -------------------------------------------------------- */
 
 volatile u8 sine_index = 0;
 volatile u8 sine_enabled = 0;
 volatile u8 sine_index1 = 0;
+static volatile u8 startup_ramp_active = 0;
 
-// Sine wave lookup table (64 samples, 0-65535 range)
+/* Sine wave lookup table (64 samples, 0-4095 range) */
 const u16 sine_table[64] = {
     2048, 2248, 2447, 2642, 2831, 3013, 3185, 3347,
     3496, 3631, 3751, 3854, 3940, 4007, 4056, 4085,
@@ -35,53 +88,172 @@ const u16 sine_table[64] = {
      599,  748,  910, 1082, 1264, 1453, 1648, 1847
 };
 
-void Upd() {
+static void Upd(void)
+{
     XGpio_DiscreteWrite(&G0, 1, spd);
     XGpio_DiscreteWrite(&G0, 2, trq);
     XGpio_DiscreteWrite(&G1, 1, trap);
-    XGpio_DiscreteWrite(&G1, 2, (test_bit<<3)|(1<<2)|(bemf<<1)|dir);
 
-    // Only write constant if sine wave disabled
-    if(sine_enabled) {
-		XGpio_DiscreteWrite(&G2, 2, sine_table[sine_index]); //sine_table[sine_index]
-		sine_index++;
-		if(sine_index >= 64) sine_index = 0;
-		sine_index1 = sine_index;
-	}
-    if(!sine_enabled) {
-        XGpio_DiscreteWrite(&G2, 2, current_rpm);
+    /* bit3=test_bit, bit2=align_en, bit1=0, bit0=dir */
+    XGpio_DiscreteWrite(&G1, 2, (test_bit << 3) | (align_en << 2) | (0 << 1) | dir);
+
+    if (sine_enabled) {
+        XGpio_DiscreteWrite(&G2, 2, sine_table[sine_index]);
+        sine_index++;
+        if (sine_index >= 64) sine_index = 0;
+        sine_index1 = sine_index;
+    } else {
+        XGpio_DiscreteWrite(&G2, 2, scaled);
     }
 }
 
-
-void ExternalIsr(void *CallbackRef)
+/* Hold a fixed commutation vector in FPGA while applying torque */
+static void align_rotor(void)
 {
-	// Read GPIO2 channel 1
-	gpio2_in = XGpio_DiscreteRead(&G2, 1);
+    u16 saved_trq  = trq;
+    u8  saved_trap = trap;
 
-	// Calculate RPM: rpm = (gpio2_ch1 * 65535) / 6000
-	current_rpm = (u16)(uint16_t)((180UL * 100000000UL) / ( gpio2_in));
-	//(uint16_t)((60UL * 100000000UL) / gpio2_in);
-	// Calculate target RPM from speed setpoint (spd maps 0-65535 to 0-10000 RPM)
-	u32 target_rpm = (spd * 10000u) / 65535u;
+    startup_ramp_active = 1;
 
-	// Calculate ±10% tolerance
-	u32 rpm_low = target_rpm - (target_rpm / 10);
-	u32 rpm_high = target_rpm + (target_rpm / 10);
+    /* Fixed vector / square drive during align */
+    trap = ALIGN_TRAP;
+    trq  = ALIGN_TRQ;
 
-	// Check if current RPM is within ±10% of target
-	if(current_rpm >= rpm_low && current_rpm <= rpm_high) {
-		// Within tolerance - call Upd()
-		Upd();
-		//xil_printf(current_rpm);
-	}
+    /* Must be nonzero so TOP outputs are enabled */
+    spd  = ALIGN_SPD;
+
+    align_en = 1;
+    Upd();
+
+    usleep(ALIGN_TIME_MS * 1000);
+
+    /* Release align */
+    align_en = 0;
+
+    /* Restore torque/mode, but leave speed at 0 so ramp starts cleanly */
+    spd  = 0;
+    trq  = saved_trq;
+    trap = saved_trap;
+
+    Upd();
+
+    startup_ramp_active = 0;
 }
 
-void Init() {
+/* Ramp speed from small nonzero value up to target */
+static void ramp_up_from_zero(u16 target_spd)
+{
+    u16 s;
+
+    if (target_spd == 0) {
+        spd = 0;
+        Upd();
+        return;
+    }
+
+    startup_ramp_active = 1;
+
+    s = (target_spd < START_RAMP_BEGIN_SPD) ? target_spd : START_RAMP_BEGIN_SPD;
+
+    spd = s;
+    Upd();
+    usleep(START_RAMP_DELAY_MS * 1000);
+
+    while (s < target_spd) {
+        u32 next = (u32)s + START_RAMP_STEP;
+        if (next > target_spd) next = target_spd;
+
+        s = (u16)next;
+        spd = s;
+        Upd();
+        usleep(START_RAMP_DELAY_MS * 1000);
+    }
+
+    startup_ramp_active = 0;
+}
+
+/* Detect start event: speed command goes from 0 -> nonzero */
+static void handle_start_event(void)
+{
+    if (last_spd_cmd == 0 && spd > 0) {
+        u16 target_spd = spd;
+
+        align_rotor();
+        ramp_up_from_zero(target_spd);
+    }
+
+    last_spd_cmd = spd;
+}
+
+/**
+ * ISR is triggered by Verilog "valid" pulse (measurement completed).
+ * GPIO2 channel 1 contains the latched period value.
+ * We apply a midpoint filter (min/max midpoint) to period, then compute RPM.
+ */
+void ExternalIsr(void *CallbackRef)
+{
+    (void)CallbackRef;
+
+    gpio2_count++;
+
+    /* Read GPIO2 channel 1 (latched period) */
+    {
+        u32 sample = XGpio_DiscreteRead(&G2, 1);
+
+        if (sample == 0) {
+            return;
+        }
+
+        gpio2_in = sample;
+
+        /* Midpoint filter on period */
+        gpio2_ma_buf[gpio2_ma_idx] = sample;
+
+        gpio2_ma_idx++;
+        if (gpio2_ma_idx >= GPIO2_MA_LEN) gpio2_ma_idx = 0;
+
+        if (gpio2_ma_count < GPIO2_MA_LEN) {
+            gpio2_ma_count++;
+        }
+
+        {
+            u32 minv = 0xFFFFFFFFu;
+            u32 maxv = 0u;
+            u32 i;
+
+            for (i = 0; i < gpio2_ma_count; i++) {
+                u32 vv = gpio2_ma_buf[i];
+                if (vv < minv) minv = vv;
+                if (vv > maxv) maxv = vv;
+            }
+
+            gpio2_in_avg = minv + ((maxv - minv) / 2u);
+        }
+    }
+
+    if (gpio2_in_avg > 0) {
+        u32 tmp;
+
+        current_rpm = (u32)((180UL * 100000000UL) / gpio2_in_avg);
+
+        /* Clamp to avoid unsigned underflow */
+        tmp = (173UL * current_rpm) / 20UL;
+        scaled = (tmp > 9050UL) ? (tmp - 9050UL) : 0UL;
+    } else {
+        return;
+    }
+
+    /* Do not let ISR interfere with align/ramp sequencing */
+    if (!startup_ramp_active) {
+        Upd();
+    }
+}
+
+static void Init(void)
+{
     XSysMon_Config *c = XSysMon_LookupConfig(XPAR_SYSMON_0_DEVICE_ID);
     XSysMon_CfgInitialize(&S, c, c->BaseAddress);
     XSysMon_SetSequencerMode(&S, XSM_SEQ_MODE_CONTINPASS);
-    //XSysMon_SetSeqChEnables(&S, XSM_SEQ_CH_AUX03|XSM_SEQ_CH_AUX10|XSM_SEQ_CH_AUX02);
 
     XGpio_Initialize(&G0, XPAR_AXI_GPIO_0_DEVICE_ID);
     XGpio_Initialize(&G1, XPAR_AXI_GPIO_1_DEVICE_ID);
@@ -92,132 +264,166 @@ void Init() {
     XGpio_SetDataDirection(&G0, 2, 0);
     XGpio_SetDataDirection(&G1, 1, 0);
     XGpio_SetDataDirection(&G1, 2, 0);
-    XGpio_SetDataDirection(&G2, 1, 1);
-    XGpio_SetDataDirection(&G2, 2, 0);
+    XGpio_SetDataDirection(&G2, 1, 1); /* input: period */
+    XGpio_SetDataDirection(&G2, 2, 0); /* output: rpm/sine */
     XGpio_SetDataDirection(&G3, 1, 1);
+
+    align_en = 0;
 }
 
-void SetupInterrupts(void)
+static void SetupInterrupts(void)
 {
-    // Initialize exception handling
     Xil_ExceptionInit();
 
-    // Register ISR for external interrupt (directly connected to MicroBlaze)
     Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_INT,
-                                  (Xil_ExceptionHandler)ExternalIsr,
-                                  NULL);
+                                 (Xil_ExceptionHandler)ExternalIsr,
+                                 NULL);
 
-    // Enable MicroBlaze interrupts
     Xil_ExceptionEnable();
-
-    // Note: No GPIO interrupt setup needed - external signal triggers directly
 }
 
-/*
-void ReadADC() {
-    u = XSysMon_GetAdcData(&S, XSM_CH_AUX_MIN+3);
-    v = XSysMon_GetAdcData(&S, XSM_CH_AUX_MIN+10);
-    w = XSysMon_GetAdcData(&S, XSM_CH_AUX_MIN+2);
-}*/
-
-u32 GetNum() {
+static u32 GetNum(void)
+{
     u32 n = 0;
     char c;
-    while(1) {
+
+    while (1) {
         c = inbyte();
-        if(c=='\r'||c=='\n') break;
+        if (c == '\r' || c == '\n') break;
         xil_printf("%c", c);
-        if(c>='0'&&c<='9') n = n*10+(c-'0');
+        if (c >= '0' && c <= '9') n = n * 10 + (u32)(c - '0');
     }
+
     xil_printf("\r\n");
     return n;
 }
 
-int main()
+int main(void)
 {
+    u16 cnt = 0;
+    int n;
+
     init_platform();
     Init();
     SetupInterrupts();
     Upd();
 
     xil_printf("BLDC\r\n");
-    xil_printf("219\r\n");
+    xil_printf("Please speed i need this :()\r\n");
 
-    u16 cnt = 0;
-    int n;
-
-    while(1) {
-        // Periodic GPIO3 read
-        if(++cnt >= 1000) {
-            gpio3_in = XGpio_DiscreteRead(&G3, 1);
+    while (1) {
+        if (++cnt >= 1000) {
+            gpio3_in = (u16)XGpio_DiscreteRead(&G3, 1);
             cnt = 0;
         }
 
         xil_printf(">");
-        char c = inbyte();
-        xil_printf("%c\r\n", c);
+        {
+            char c = inbyte();
+            xil_printf("%c\r\n", c);
 
-        if(c=='s') { xil_printf("S:"); spd=(u16)GetNum(); Upd(); }
-        else if(c=='t') { xil_printf("T:"); trq=(u16)GetNum(); Upd(); }
-        else if(c=='p') { xil_printf("P:"); trap=(u8)GetNum(); if(trap>100)trap=100; Upd(); }
-        else if(c=='d') { dir=!dir; xil_printf("D:%d\r\n",dir); Upd(); }
-        else if(c=='m') { bemf=!bemf; xil_printf("M:%d\r\n",bemf); Upd(); }
-        else if(c=='+'||c=='=') {
-            n=(int)spd+100;
-            if(n>65535)n=65535;
-            spd=(u16)n;
-            XGpio_DiscreteWrite(&G0,1,spd);
-            xil_printf("S:%d\r\n",spd);
-        }
-        else if(c=='-') {
-            n=(int)spd-100;
-            if(n<0)n=0;
-            spd=(u16)n;
-            XGpio_DiscreteWrite(&G0,1,spd);
-            xil_printf("S:%d\r\n",spd);
-        }
-        else if(c=='i') {
-            //ReadADC();
-            gpio3_in = XGpio_DiscreteRead(&G3, 1);
-            //u32 rpm = 0;
-            xil_printf("S:%d T:%d P:%d D:%d M:%d Z:%d\r\n",spd,trq,trap,dir,bemf,test_bit);
-            xil_printf("G2:%u (%u RPM) G3:%d IntCnt:%u\r\n",gpio2_in,current_rpm,gpio3_in,gpio2_count);
-            xil_printf("U:%X V:%X W:%X\r\n",u,v,w);
-        }
-        else if(c=='r') {
-            // Manual read of GPIO2 to compare
-            u32 manual = XGpio_DiscreteRead(&G2, 1);
-            u32 rpm_manual = 0;
-            u32 rpm_isr = 0;
+            if (c == 's') {
+                xil_printf("S:");
+                spd = (u16)GetNum();
+                handle_start_event();
+                Upd();
+            }
+            else if (c == 't') {
+                xil_printf("T:");
+                trq = (u16)GetNum();
+                Upd();
+            }
+            else if (c == 'p') {
+                xil_printf("P:");
+                trap = (u8)GetNum();
+                if (trap > 100) trap = 100;
+                Upd();
+            }
+            else if (c == 'd') {
+                dir = !dir;
+                xil_printf("D:%d\r\n", dir);
+                Upd();
+            }
+            else if (c == 'm') {
+                align_en = !align_en;
+                xil_printf("ALIGN_EN:%d\r\n", align_en);
+                Upd();
+            }
+            else if (c == '+' || c == '=') {
+                n = (int)spd + 100;
+                if (n > 65535) n = 65535;
+                spd = (u16)n;
+                handle_start_event();
+                XGpio_DiscreteWrite(&G0, 1, spd);
+                xil_printf("S:%d\r\n", spd);
+            }
+            else if (c == '-') {
+                n = (int)spd - 100;
+                if (n < 0) n = 0;
+                spd = (u16)n;
+                last_spd_cmd = spd;
+                XGpio_DiscreteWrite(&G0, 1, spd);
+                xil_printf("S:%d\r\n", spd);
+            }
+            else if (c == 'i') {
+                gpio3_in = (u16)XGpio_DiscreteRead(&G3, 1);
 
-            // Integer math: RPM = (60 * 10000000) / (14 * period)
-            // = 600000000 / (14 * period)
-            if(manual > 0) {
-                rpm_manual = 600000000UL / (14 * manual);
-            }
-            if(gpio2_in > 0) {
-                rpm_isr = 600000000UL / (14 * gpio2_in);
-            }
+                xil_printf("S:%d T:%d P:%d D:%d ALIGN:%d Z:%d\r\n",
+                           spd, trq, trap, dir, align_en, test_bit);
 
-            xil_printf("Manual G2:%u (%u RPM)  ISR G2:%u (%u RPM)  IntCnt:%u\r\n",
-                       manual, rpm_manual, gpio2_in, rpm_isr, gpio2_count);
-        }
-        else if(c=='z') {
-            test_bit = !test_bit;
-            Upd();
-            xil_printf("Z:%d\r\n", test_bit);
-        }
-        else if(c=='w') {
-            sine_enabled = !sine_enabled;
-            if(!sine_enabled) {
-                XGpio_DiscreteWrite(&G2, 2, 5000);  // Reset to constant
+                xil_printf("G2_period:%u avg:%u RPM:%u SRPM:%u G3:%d IntCnt:%u\r\n",
+                           gpio2_in, gpio2_in_avg, current_rpm, scaled, gpio3_in, gpio2_count);
+
+                xil_printf("U:%X V:%X W:%X\r\n", u, v, w);
             }
-            xil_printf("Sine:%d\r\n", sine_enabled);
+            else if (c == 'r') {
+                u32 manual = XGpio_DiscreteRead(&G2, 1);
+                u32 rpm_manual = 0;
+                u32 rpm_isr = 0;
+
+                if (manual > 0) {
+                    rpm_manual = 600000000UL / (14UL * manual);
+                }
+                if (gpio2_in > 0) {
+                    rpm_isr = 600000000UL / (14UL * gpio2_in);
+                }
+
+                xil_printf("Manual G2:%u (%u RPM) ISR G2:%u (%u RPM) IntCnt:%u\r\n",
+                           manual, rpm_manual, gpio2_in, rpm_isr, gpio2_count);
+            }
+            else if (c == 'z') {
+                test_bit = !test_bit;
+                Upd();
+                xil_printf("Z:%d\r\n", test_bit);
+            }
+            else if (c == 'w') {
+                sine_enabled = !sine_enabled;
+                if (!sine_enabled) {
+                    XGpio_DiscreteWrite(&G2, 2, 5000);
+                }
+                xil_printf("Sine:%d\r\n", sine_enabled);
+            }
+            else if (c == 'x') {
+                spd = 0;
+                trq = 0;
+                last_spd_cmd = 0;
+                align_en = 0;
+                startup_ramp_active = 0;
+                Upd();
+                xil_printf("X\r\n");
+            }
+            else if (c == 'q') {
+                spd = 0;
+                trq = 0;
+                last_spd_cmd = 0;
+                align_en = 0;
+                startup_ramp_active = 0;
+                Upd();
+                break;
+            }
         }
-        else if(c=='x') { spd=0; trq=0; Upd(); xil_printf("X\r\n"); }
-        else if(c=='q') { spd=0; trq=0; Upd(); break; }
     }
 
     cleanup_platform();
     return 0;
-}
+}//prescaler 16?
